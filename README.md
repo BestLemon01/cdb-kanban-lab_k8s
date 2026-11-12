@@ -317,33 +317,62 @@ curl -s http://20.205.36.32:30080/api/health
 
 *Kỳ vọng:* Nhờ `maxUnavailable: 0`, `preStop` và `readinessProbe`, quá trình nâng cấp/rollback giữ `200 OK` liên tục và toàn bộ tài khoản/task đã tạo trước đó vẫn hiển thị bình thường.
 
-### 6.5. Mô phỏng sự cố tắt 1 Worker Node & Tự phục hồi
+### 6.5. Mô phỏng sự cố tắt 1 Worker Node & Tự phục hồi (2 trường hợp)
 
-Trước khi tắt node, kiểm tra vị trí Pod `postgres` hiện tại (`kubectl get pods -n cdb-kanban -o wide`). Vì `01-postgres.yaml` dùng `emptyDir`, chọn tắt worker **không chứa** `postgres` để giữ nguyên dữ liệu (ví dụ nếu `postgres` đang ở `worker1` thì tắt `worker2`, hoặc ngược lại).
+Trước khi thử nghiệm, kiểm tra trạng thái hiện tại trên `cp` (`kubectl get nodes,pods -n cdb-kanban -o wide`). Mở sẵn Terminal 1 trên `cp` để theo dõi liên tục quá trình chuyển Pod và hồi phục node:
 
 ```bash
 # Terminal 1 (trên cp): theo dõi Node và Pod cập nhật mỗi 2 giây
 watch -n 2 "kubectl get nodes -o wide; echo; kubectl get pods -n cdb-kanban -o wide"
-# (kubectl -w chỉ hỗ trợ 1 loại resource mỗi lệnh, nên nếu dùng -w hãy mở riêng:)
+# (kubectl -w chỉ hỗ trợ 1 loại resource mỗi lệnh, nên nếu dùng -w hãy mở 2 cửa sổ riêng:)
 # kubectl get nodes -w
 # kubectl get pods -n cdb-kanban -o wide -w
+```
 
-# Terminal 2 (chạy trên máy local đã đăng nhập Azure CLI — không chạy trên cp):
-# Tắt nóng 1 worker (thay worker2/worker1 tương ứng)
+*(Các lệnh `az vm ...` bên dưới chạy trên Terminal 2 tại **máy local đã đăng nhập Azure CLI**, không chạy trên `cp`.)*
+
+#### Trường hợp 1: Tắt `worker2`, sau đó phục hồi `worker2`
+
+```powershell
+# 1. Tắt nóng worker2 (trên máy local)
 az vm deallocate -g rg-k8s -n worker2
 ```
 
-*Kết quả quan sát:*
-1. Với `--node-monitor-grace-period=20s` trên control plane và `tolerationSeconds: 10` trong các manifest, worker bị tắt chuyển `NotReady` sau ~`16–20s` và toàn bộ Pod trên node đó được tạo mới sang worker còn lại sau tổng thời gian ~`28–30s`.
-2. Mở trình duyệt hoặc `curl` vào Public IP của worker đang sống (`http://20.205.36.32:30080` hoặc `http://20.24.211.55:30080`) vẫn đăng nhập và thao tác Kanban bình thường.
-3. *(Lưu ý: Nếu tắt đúng worker đang giữ `postgres`, Pod DB mới khởi tạo lại trên worker sống sau ~30s nhưng database được tạo mới trống từ `ConfigMap/postgres-initdb`).*
+- **Quan sát trên `cp`:** sau ~`16–20s`, `worker2` chuyển `NotReady` (`--node-monitor-grace-period=20s`); sau tổng ~`28–30s` (`tolerationSeconds: 10`), các Pod từng chạy trên `worker2` được tạo mới sang `worker1`.
+- **Kiểm tra truy cập qua node sống (`worker1`):**
+  ```bash
+  curl -s http://20.205.36.32:30080/api/health
+  ```
+- **Phục hồi `worker2` (trên máy local):**
+  ```powershell
+  az vm start -g rg-k8s -n worker2
+  ```
+  Kiểm tra lại trên `cp`: `kubectl get nodes -o wide` thấy `worker2` quay lại `Ready`.
 
-Khôi phục lại node sau kiểm thử (chạy `az vm start` trên máy local, sau đó kiểm tra lại node trên `cp`):
+#### Trường hợp 2: Tắt `worker1`, sau đó phục hồi `worker1`
 
-```bash
-az vm start -g rg-k8s -n worker2
-kubectl get nodes -o wide
+*(Đảm bảo `worker2` đã quay lại `Ready` trước khi tắt `worker1`. Nếu vừa chạy xong Trường hợp 1 và muốn các Pod rải đều lại 2 node trước khi test tiếp, có thể chạy `kubectl rollout restart deployment/cdb-backend deployment/cdb-frontend -n cdb-kanban`.)*
+
+```powershell
+# 1. Tắt nóng worker1 (trên máy local)
+az vm deallocate -g rg-k8s -n worker1
 ```
+
+- **Quan sát trên `cp`:** sau ~`16–20s`, `worker1` chuyển `NotReady`; sau tổng ~`28–30s`, toàn bộ Pod trên `worker1` được chuyển sang `worker2`.
+- **Lưu ý dữ liệu DB (`emptyDir`):** Nếu Pod `postgres` đang nằm trên worker vừa bị tắt (ví dụ `worker1`), Kubernetes vẫn tự tạo lại Pod `postgres` mới sang `worker2` để ứng dụng tiếp tục chạy, nhưng database sẽ được khởi tạo trống lại từ `ConfigMap/postgres-initdb`. Nếu worker bị tắt không chứa `postgres`, dữ liệu DB được giữ nguyên.
+- **Kiểm tra truy cập qua node sống (`worker2`):**
+  ```bash
+  curl -s http://20.24.211.55:30080/api/health
+  ```
+- **Phục hồi `worker1` (trên máy local):**
+  ```powershell
+  az vm start -g rg-k8s -n worker1
+  ```
+  Sau khi cả `cp`, `worker1`, `worker2` đều về `Ready`, Kubernetes không tự kéo ngược Pod từ `worker2` về `worker1`; nếu muốn chia đều lại Pod Frontend/Backend qua 2 worker, chạy trên `cp`:
+  ```bash
+  kubectl rollout restart deployment/cdb-backend deployment/cdb-frontend -n cdb-kanban
+  kubectl get nodes,pods -n cdb-kanban -o wide
+  ```
 
 ---
 

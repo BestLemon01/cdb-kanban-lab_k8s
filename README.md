@@ -322,10 +322,14 @@ curl -s http://20.205.36.32:30080/api/health
 Trước khi tắt node, kiểm tra vị trí Pod `postgres` hiện tại (`kubectl get pods -n cdb-kanban -o wide`). Vì `01-postgres.yaml` dùng `emptyDir`, chọn tắt worker **không chứa** `postgres` để giữ nguyên dữ liệu (ví dụ nếu `postgres` đang ở `worker1` thì tắt `worker2`, hoặc ngược lại).
 
 ```bash
-# Terminal 1 (trên cp): theo dõi Node và Pod thay đổi theo thời gian thực
-kubectl get nodes,pods -n cdb-kanban -o wide -w
+# Terminal 1 (trên cp): theo dõi Node và Pod cập nhật mỗi 2 giây
+watch -n 2 "kubectl get nodes -o wide; echo; kubectl get pods -n cdb-kanban -o wide"
+# (kubectl -w chỉ hỗ trợ 1 loại resource mỗi lệnh, nên nếu dùng -w hãy mở riêng:)
+# kubectl get nodes -w
+# kubectl get pods -n cdb-kanban -o wide -w
 
-# Terminal 2 (trên máy local có Azure CLI): tắt nóng 1 worker (thay worker2/worker1 tương ứng)
+# Terminal 2 (chạy trên máy local đã đăng nhập Azure CLI — không chạy trên cp):
+# Tắt nóng 1 worker (thay worker2/worker1 tương ứng)
 az vm deallocate -g rg-k8s -n worker2
 ```
 
@@ -334,7 +338,7 @@ az vm deallocate -g rg-k8s -n worker2
 2. Mở trình duyệt hoặc `curl` vào Public IP của worker đang sống (`http://20.205.36.32:30080` hoặc `http://20.24.211.55:30080`) vẫn đăng nhập và thao tác Kanban bình thường.
 3. *(Lưu ý: Nếu tắt đúng worker đang giữ `postgres`, Pod DB mới khởi tạo lại trên worker sống sau ~30s nhưng database được tạo mới trống từ `ConfigMap/postgres-initdb`).*
 
-Khôi phục lại node sau kiểm thử:
+Khôi phục lại node sau kiểm thử (chạy `az vm start` trên máy local, sau đó kiểm tra lại node trên `cp`):
 
 ```bash
 az vm start -g rg-k8s -n worker2

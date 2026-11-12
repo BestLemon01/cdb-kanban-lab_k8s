@@ -1,11 +1,22 @@
 const STATUSES = ["todo", "doing", "done"];
 const LABEL = { todo: "Todo", doing: "Doing", done: "Done" };
 const THEME_KEY = "cdb-theme";
+const AUTH_PATHS = new Set(["/login", "/login.html", "/register", "/register.html"]);
 const $ = (sel) => document.querySelector(sel);
 
-const state = { user: null, tasks: [], loading: true, query: "", busy: new Set() };
+const state = { user: null, tasks: [], loading: true, query: "", busy: new Set(), moving: new Set() };
+const taskQueues = new Map();
 let pendingDelete = null;
 let slowTimer = null;
+
+function enqueueTask(id, fn) {
+  const prev = taskQueues.get(id) || Promise.resolve();
+  const next = prev.then(fn, fn).finally(() => {
+    if (taskQueues.get(id) === next) taskQueues.delete(id);
+  });
+  taskQueues.set(id, next);
+  return next;
+}
 
 const byOrder = (a, b) => a.position - b.position || a.id - b.id;
 
@@ -37,7 +48,7 @@ async function api(path, options = {}) {
     throw new ApiError(0, "network_error", "Không kết nối được máy chủ");
   }
   const body = await res.json().catch(() => null);
-  if (res.status === 401 && location.pathname !== "/login") {
+  if (res.status === 401 && !AUTH_PATHS.has(location.pathname)) {
     location.replace("/login");
     throw new ApiError(401, "unauthenticated", "Phiên đăng nhập đã hết");
   }
@@ -230,25 +241,28 @@ function render() {
 
 async function patchTask(id, patch) {
   const task = state.tasks.find((t) => t.id === id);
-  if (!task || state.busy.has(id)) return;
-  const before = { ...task };
+  if (!task) return;
+  const prevFields = {};
+  for (const key of Object.keys(patch)) prevFields[key] = task[key];
   Object.assign(task, patch);
-  state.busy.add(id);
-  render();
-  try {
-    const row = await api("/api/tasks/" + id, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: state.user.id, ...patch }),
-    });
-    Object.assign(task, row);
-  } catch (err) {
-    Object.assign(task, before);
-    toast(err.message, "error");
-  } finally {
-    state.busy.delete(id);
-    render();
-  }
+  const node = document.querySelector('.task[data-id="' + id + '"]');
+  if (node) node.classList.add("busy");
+  return enqueueTask(id, async () => {
+    try {
+      const row = await api("/api/tasks/" + id, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: state.user.id, ...patch }),
+      });
+      for (const key of Object.keys(patch)) task[key] = row[key];
+      task.updated_at = row.updated_at;
+    } catch (err) {
+      Object.assign(task, prevFields);
+      toast(err.message, "error");
+    } finally {
+      if (!state.moving.has(id)) render();
+    }
+  });
 }
 
 function optimisticMove(task, status, position) {
@@ -268,25 +282,33 @@ function optimisticMove(task, status, position) {
 
 async function moveTask(id, status, position) {
   const task = state.tasks.find((t) => t.id === id);
-  if (!task || state.busy.has(id)) return;
-  const before = state.tasks.map((t) => ({ ...t }));
+  if (!task || state.moving.has(id)) return;
+  const prevStatus = task.status;
+  const prevPositions = new Map(state.tasks.map((t) => [t.id, t.position]));
   optimisticMove(task, status, position);
+  state.moving.add(id);
   state.busy.add(id);
   sortTasks();
   render();
   try {
-    const body = { user_id: state.user.id, status };
-    if (position !== undefined) body.position = position;
-    const row = await api("/api/tasks/" + id, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+    await enqueueTask(id, async () => {
+      const body = { user_id: state.user.id, status };
+      if (position !== undefined) body.position = position;
+      const row = await api("/api/tasks/" + id, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      Object.assign(task, row);
     });
-    Object.assign(task, row);
   } catch (err) {
-    state.tasks = before;
+    task.status = prevStatus;
+    state.tasks.forEach((t) => {
+      if (prevPositions.has(t.id)) t.position = prevPositions.get(t.id);
+    });
     toast(err.message, "error");
   } finally {
+    state.moving.delete(id);
     state.busy.delete(id);
     sortTasks();
     render();
@@ -312,10 +334,13 @@ async function removeTask(id) {
   state.tasks.splice(index, 1);
   render();
   try {
-    await api("/api/tasks/" + id + "?user_id=" + encodeURIComponent(state.user.id), { method: "DELETE" });
+    await enqueueTask(id, () =>
+      api("/api/tasks/" + id + "?user_id=" + encodeURIComponent(state.user.id), { method: "DELETE" }),
+    );
     toast("Đã xoá việc", "success");
   } catch (err) {
     state.tasks.splice(index, 0, task);
+    sortTasks();
     render();
     toast(err.message, "error");
   }
@@ -323,6 +348,8 @@ async function removeTask(id) {
 
 function startEdit(task, titleBtn) {
   if (state.busy.has(task.id)) return;
+  const node = titleBtn.closest(".task");
+  if (node) node.draggable = false;
   const input = el("input", "title-edit");
   input.type = "text";
   input.maxLength = 200;
@@ -335,11 +362,15 @@ function startEdit(task, titleBtn) {
   const finish = (save) => {
     if (finished) return;
     finished = true;
+    if (node) node.draggable = true;
     const next = input.value.trim();
     if (!save || !next || next === task.title) {
-      render();
+      if (input.isConnected) input.replaceWith(titleBtn);
       return;
     }
+    titleBtn.textContent = next;
+    titleBtn.setAttribute("aria-label", "Sửa tiêu đề: " + next);
+    if (input.isConnected) input.replaceWith(titleBtn);
     patchTask(task.id, { title: next });
   };
   input.addEventListener("keydown", (e) => {
@@ -532,6 +563,7 @@ function initBoard() {
 
   document.addEventListener("keydown", (e) => {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (document.querySelector("dialog[open]")) return;
     const tag = (e.target.tagName || "").toLowerCase();
     if (tag === "input" || tag === "select" || tag === "textarea" || e.target.isContentEditable) return;
     if (e.key === "/") {
@@ -547,18 +579,30 @@ function initBoard() {
   beginLoad();
 
   (async () => {
+    let redirecting = false;
     try {
-      const me = await api("/api/me");
+      const me = await api("/api/session");
+      if (!me || !me.user) {
+        redirecting = true;
+        location.replace("/login");
+        return;
+      }
       state.user = me.user;
       $("#account-email").textContent = me.user.email;
       $("#avatar").textContent = me.user.email.slice(0, 1);
       await loadTasks();
     } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        redirecting = true;
+        return;
+      }
       toast(err.message, "error");
     } finally {
-      state.loading = false;
       endLoad();
-      render();
+      if (!redirecting) {
+        state.loading = false;
+        render();
+      }
     }
   })();
 }

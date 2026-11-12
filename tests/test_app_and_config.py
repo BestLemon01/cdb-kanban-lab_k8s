@@ -99,7 +99,11 @@ class TestLayoutAndFrontend(unittest.TestCase):
             self.assertIn("cluster-meta", html)
 
         self.assertIn("/api/health", js)
+        self.assertIn("/api/session", js)
         self.assertIn("/frontend-info.json", js)
+        self.assertIn("/login.html", js)
+        self.assertIn("dialog[open]", js)
+        self.assertIn("enqueueTask", js)
 
 
 class TestBackendApp(unittest.TestCase):
@@ -230,6 +234,44 @@ class TestBackendApp(unittest.TestCase):
         self.assertIn("GET /api/health -> 200", lines[0])
         self.assertIn("via=FE:worker2bad1/cdb-frontend-abc", lines[0])
         self.assertIn("GET /api/health -> 503", lines[1])
+
+    def test_session_endpoint_and_vietnamese_auth_errors(self):
+        mod = load_backend_module(
+            {
+                "APP_SECRET_KEY": "unit-test-secret",
+                "DB_HOST": "127.0.0.1",
+                "DB_NAME": "studydb",
+                "DB_USER": "app_user",
+                "DB_PASSWORD": "secret",
+                "DB_SSLMODE": "disable",
+                "COOKIE_SECURE": "false",
+                "APP_VERSION": "v1",
+            }
+        )
+        self.addCleanup(lambda: mod.pool.close(timeout=0.5))
+        client = mod.app.test_client()
+
+        anon = client.get("/api/session")
+        self.assertEqual(anon.status_code, 200)
+        self.assertEqual(anon.get_json(), {"user": None})
+
+        with client.session_transaction() as sess:
+            sess["uid"] = 7
+            sess["email"] = "user@example.com"
+        with mock.patch.object(mod, "q_one", return_value={"id": 7, "email": "user@example.com"}):
+            authed = client.get("/api/session")
+        self.assertEqual(authed.status_code, 200)
+        self.assertEqual(authed.get_json(), {"user": {"id": 7, "email": "user@example.com"}})
+
+        with mock.patch.object(mod, "q_one", side_effect=mod.pg_errors.UniqueViolation("dup")):
+            dup = client.post("/api/register", json={"email": "dup@example.com", "password": "Password123!"})
+        self.assertEqual(dup.status_code, 409)
+        self.assertEqual(dup.get_json()["error"], "Email này đã được đăng ký.")
+
+        with mock.patch.object(mod, "q_all", return_value=[]):
+            bad_login = client.post("/api/login", json={"email": "no@example.com", "password": "WrongPass1!"})
+        self.assertEqual(bad_login.status_code, 401)
+        self.assertEqual(bad_login.get_json()["error"], "Email hoặc mật khẩu không đúng.")
 
 
 if __name__ == "__main__":

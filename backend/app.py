@@ -27,7 +27,7 @@ PROBE_PATHS = frozenset(("/livez", "/api/health"))
 SAFE_META_RE = re.compile(r"[^A-Za-z0-9._-]+")
 PUBLIC_PATHS = frozenset((
     "/favicon.ico", "/livez",
-    "/api/login", "/api/register", "/api/health",
+    "/api/login", "/api/register", "/api/session", "/api/health",
 ))
 CSP = (
     "default-src 'self'; img-src 'self' data:; style-src 'self'; "
@@ -262,7 +262,7 @@ def clean_email(value):
         raise ValueError("email must be a string")
     email = value.strip().lower()
     if len(email) > 254 or not EMAIL_RE.match(email):
-        raise ValueError("email khong hop le")
+        raise ValueError("Email không hợp lệ.")
     return email
 
 
@@ -270,9 +270,9 @@ def clean_password(value):
     if not isinstance(value, str):
         raise ValueError("password must be a string")
     if len(value) < 8:
-        raise ValueError("mat khau phai co it nhat 8 ky tu")
+        raise ValueError("Mật khẩu phải có ít nhất 8 ký tự.")
     if len(value) > MAX_PASSWORD:
-        raise ValueError("mat khau qua dai")
+        raise ValueError("Mật khẩu quá dài.")
     return value
 
 
@@ -290,9 +290,9 @@ def session_user():
 def same_user(user_id):
     current = session_user()
     if current is None:
-        return fail(401, "can dang nhap", "unauthenticated")
+        return fail(401, "Cần đăng nhập.", "unauthenticated")
     if user_id != current["id"]:
-        return fail(403, "user_id khong khop phien dang nhap", "forbidden_user")
+        return fail(403, "Tài khoản không khớp phiên đăng nhập.", "forbidden_user")
     return None
 
 
@@ -302,7 +302,7 @@ def before_request():
     if request.path in PUBLIC_PATHS:
         return None
     if not session.get("uid"):
-        return fail(401, "can dang nhap", "unauthenticated")
+        return fail(401, "Cần đăng nhập.", "unauthenticated")
 
 
 @app.after_request
@@ -350,29 +350,29 @@ def on_value_error(err):
 
 @app.errorhandler(pg_errors.CheckViolation)
 def on_check_violation(err):
-    return fail(400, "du lieu khong hop le", "check_violation")
+    return fail(400, "Dữ liệu không hợp lệ.", "check_violation")
 
 
 @app.errorhandler(pg_errors.UniqueViolation)
 def on_unique_violation(err):
-    return fail(409, "du lieu da ton tai", "unique_violation")
+    return fail(409, "Dữ liệu đã tồn tại.", "unique_violation")
 
 
 @app.errorhandler(pg_errors.ForeignKeyViolation)
 def on_foreign_key(err):
-    return fail(400, "user_id khong ton tai", "foreign_key_violation")
+    return fail(400, "Tài khoản không tồn tại.", "foreign_key_violation")
 
 
 @app.errorhandler(OperationalError)
 def on_operational(err):
     app.logger.warning("db unavailable: %s", type(err).__name__)
-    return fail(503, "co so du lieu tam thoi khong san sang", "db_unavailable")
+    return fail(503, "Cơ sở dữ liệu tạm thời chưa sẵn sàng.", "db_unavailable")
 
 
 @app.errorhandler(pg_errors.Error)
 def on_db_error(err):
     app.logger.error("db error: %s", type(err).__name__)
-    return fail(500, "loi co so du lieu", "db_error")
+    return fail(500, "Lỗi cơ sở dữ liệu.", "db_error")
 
 
 @app.errorhandler(HTTPException)
@@ -385,7 +385,7 @@ def on_http_error(err):
 @app.errorhandler(Exception)
 def on_unexpected(err):
     app.logger.exception("unhandled error")
-    return fail(500, "loi may chu", "internal_error")
+    return fail(500, "Lỗi máy chủ.", "internal_error")
 
 
 @app.get("/favicon.ico")
@@ -398,10 +398,13 @@ def register():
     data = payload()
     email = clean_email(data.get("email"))
     password = clean_password(data.get("password"))
-    row = q_one(
-        "INSERT INTO users (email, password_hash) VALUES (%s, %s) RETURNING id, email",
-        (email, generate_password_hash(password)),
-    )
+    try:
+        row = q_one(
+            "INSERT INTO users (email, password_hash) VALUES (%s, %s) RETURNING id, email",
+            (email, generate_password_hash(password)),
+        )
+    except pg_errors.UniqueViolation:
+        return fail(409, "Email này đã được đăng ký.", "unique_violation")
     session.clear()
     session.permanent = True
     session["uid"] = row["id"]
@@ -415,7 +418,7 @@ def login():
     email = data.get("email")
     password = data.get("password")
     if not isinstance(email, str) or not isinstance(password, str) or not email.strip() or not password:
-        raise ValueError("email and password are required")
+        raise ValueError("Nhập đủ email và mật khẩu.")
     rows = q_all(
         "SELECT id, email, password_hash FROM users WHERE lower(email) = lower(%s)",
         (email.strip(),),
@@ -425,7 +428,7 @@ def login():
     valid = check_password_hash(candidate, password)
     if not rows or not stored or not valid:
         app.logger.warning("login failed ip=%s", request.remote_addr)
-        return fail(401, "email hoac mat khau khong dung", "invalid_credentials")
+        return fail(401, "Email hoặc mật khẩu không đúng.", "invalid_credentials")
     user = {"id": rows[0]["id"], "email": rows[0]["email"]}
     session.clear()
     session.permanent = True
@@ -440,13 +443,25 @@ def logout():
     return jsonify(ok=True)
 
 
+@app.get("/api/session")
+def auth_session():
+    current = session_user()
+    if current is None:
+        return jsonify(user=None)
+    row = q_one("SELECT id, email FROM users WHERE id = %s", (current["id"],))
+    if row is None:
+        session.clear()
+        return jsonify(user=None)
+    return jsonify(user=row)
+
+
 @app.get("/api/me")
 def me():
     current = session_user()
     row = q_one("SELECT id, email FROM users WHERE id = %s", (current["id"],))
     if row is None:
         session.clear()
-        return fail(401, "phien khong con hop le", "unauthenticated")
+        return fail(401, "Phiên đăng nhập không còn hợp lệ.", "unauthenticated")
     return jsonify(user=row)
 
 
@@ -547,7 +562,7 @@ def health():
                 version=APP_VERSION,
                 pod=POD_NAME,
                 node=NODE_NAME,
-                error="co so du lieu tam thoi khong san sang",
+                error="Cơ sở dữ liệu tạm thời chưa sẵn sàng.",
                 code="db_unavailable",
             ),
             503,

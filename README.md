@@ -296,16 +296,28 @@ sudo iptables -t nat -L -n -v | grep -B 3 -A 1 cdb-kanban
 
 ### 6.3. Mở rộng số lượng bản sao (Scale Replicas)
 
+Cả `cdb-frontend` và `cdb-backend` đều **stateless** (phiên đăng nhập lưu trong signed cookie ký bằng `APP_SECRET_KEY`, không giữ trạng thái trong RAM Pod) nên đều có thể scale ngang bình thường; chỉ riêng `postgres` giữ `replicas: 1` (`strategy: Recreate`) vì là thành phần stateful lưu dữ liệu cơ sở dữ liệu.
+
 ```bash
+# Mặc định demo scale Frontend lên 4 Pod (và thu gọn về 2 sau khi kiểm tra)
 kubectl scale deployment cdb-frontend -n cdb-kanban --replicas=4
 kubectl rollout status deployment/cdb-frontend -n cdb-kanban
 kubectl get pods -n cdb-kanban -l app=cdb-frontend -o wide
-
-# Thu gọn lại trạng thái ban đầu sau khi kiểm tra
 kubectl scale deployment cdb-frontend -n cdb-kanban --replicas=2
+
+# Hoặc scale Backend lên 4 Pod khi cần (cùng cơ chế phân bố 2 Pod/worker)
+kubectl scale deployment cdb-backend -n cdb-kanban --replicas=4
+kubectl rollout status deployment/cdb-backend -n cdb-kanban
+kubectl get pods -n cdb-kanban -l app=cdb-backend -o wide
+kubectl scale deployment cdb-backend -n cdb-kanban --replicas=2
 ```
 
-*Kỳ vọng:* 4/4 Pod đạt `Running` và tự phân bố 2 Pod trên `worker1`, 2 Pod trên `worker2`.
+*Kỳ vọng:* 4/4 Pod đạt `Running` và tự phân bố 2 Pod trên `worker1`, 2 Pod trên `worker2`. *(Trong `demo_menu.py` mục `4`, bạn cũng có thể chọn `1. cdb-frontend` hoặc `2. cdb-backend`.)*
+
+**Vì sao lab mặc định chọn scale `cdb-frontend` lên 4 Pod trước thay vì scale cả `cdb-backend`?**
+- **Tài nguyên nhẹ hơn:** 1 Pod `cdb-frontend` (Nginx) chỉ request `25m` CPU / `32Mi` RAM (limit `150m` / `128Mi`), trong khi 1 Pod `cdb-backend` (Python + Flask + Gunicorn) request `50m` CPU / `128Mi` RAM (limit `250m` / `256Mi`).
+- **Tránh nhân số connection vào PostgreSQL:** Mỗi Pod `cdb-backend` chạy 2 Gunicorn worker (`--workers 2`), mỗi worker giữ một `ConnectionPool(min_size=1, max_size=5)`, tức là **2–10 connection DB cho mỗi Pod BE** (`4` Pod BE = `8–40` connection đổ về 1 Pod `postgres` duy nhất). Thực tế chỉ scale BE khi API nghẽn CPU và DB còn dư ngưỡng `max_connections` (hoặc có pooler như PgBouncer).
+- **Dễ quan sát ở cổng `:30080`:** `frontend-svc` đứng ngay cửa `NodePort`, nên khi scale FE lên 4 Pod có thể thấy ngay footer / `/frontend-info.json` xoay vòng qua cả 4 Pod trên 2 worker.
 
 ### 6.4. Cập nhật không gián đoạn (`v1 -> v2`) & Rollback (`v2 -> v1`)
 
@@ -343,13 +355,21 @@ watch -n 2 "kubectl get nodes -o wide; echo; kubectl get pods -n cdb-kanban -o w
 # kubectl get pods -n cdb-kanban -o wide -w
 ```
 
-*(Các lệnh `az vm ...` bên dưới chạy trên Terminal 2 tại **máy local đã đăng nhập Azure CLI**, không chạy trên `cp`.)*
+VM `cp` đã được cài Azure CLI và bật **System-Assigned Managed Identity (`MSI`)** với quyền quản trị VM trong `rg-k8s`, nên có thể mở Terminal 2 **trực tiếp trên `cp`** để chạy lệnh tắt/bật các worker mà không cần lưu secret key lên máy hay quay về máy local *(nếu demo từ máy local đã cài & đăng nhập Azure CLI thì các lệnh `az vm ...` bên dưới vẫn chạy tương tự)*:
+
+```bash
+# Terminal 2 (trên cp): đăng nhập bằng Managed Identity của VM cp (chỉ cần chạy lại khi session hết hạn)
+az login --identity
+az account show -o table
+```
+
+*(Mẹo: thêm `--no-wait` vào sau lệnh `az vm deallocate` / `az vm start` nếu muốn shell trả prompt về ngay để vừa chạy vừa quan sát Terminal 1.)*
 
 #### Trường hợp 1: Tắt `worker2`, sau đó phục hồi `worker2`
 
-```powershell
-# 1. Tắt nóng worker2 (trên máy local)
-az vm deallocate -g rg-k8s -n worker2
+```bash
+# 1. Tắt nóng worker2 (chạy trực tiếp trên cp)
+az vm deallocate -g rg-k8s -n worker2 --no-wait
 ```
 
 - **Quan sát trên `cp`:** sau ~`16–20s`, `worker2` chuyển `NotReady` (`--node-monitor-grace-period=20s`); sau tổng ~`28–30s` (`tolerationSeconds: 10`), các Pod từng chạy trên `worker2` được tạo mới sang `worker1`.
@@ -357,8 +377,8 @@ az vm deallocate -g rg-k8s -n worker2
   ```bash
   curl -s http://20.205.36.32:30080/api/health
   ```
-- **Phục hồi `worker2` (trên máy local):**
-  ```powershell
+- **Phục hồi `worker2` (chạy trực tiếp trên `cp`):**
+  ```bash
   az vm start -g rg-k8s -n worker2
   ```
   Kiểm tra lại trên `cp`: `kubectl get nodes -o wide` thấy `worker2` quay lại `Ready`.
@@ -367,9 +387,9 @@ az vm deallocate -g rg-k8s -n worker2
 
 *(Đảm bảo `worker2` đã quay lại `Ready` trước khi tắt `worker1`. Nếu vừa chạy xong Trường hợp 1 và muốn các Pod rải đều lại 2 node trước khi test tiếp, có thể chạy `kubectl rollout restart deployment/cdb-backend deployment/cdb-frontend -n cdb-kanban`.)*
 
-```powershell
-# 1. Tắt nóng worker1 (trên máy local)
-az vm deallocate -g rg-k8s -n worker1
+```bash
+# 1. Tắt nóng worker1 (chạy trực tiếp trên cp)
+az vm deallocate -g rg-k8s -n worker1 --no-wait
 ```
 
 - **Quan sát trên `cp`:** sau ~`16–20s`, `worker1` chuyển `NotReady`; sau tổng ~`28–30s`, toàn bộ Pod trên `worker1` được chuyển sang `worker2`.
@@ -378,8 +398,8 @@ az vm deallocate -g rg-k8s -n worker1
   ```bash
   curl -s http://20.24.211.55:30080/api/health
   ```
-- **Phục hồi `worker1` (trên máy local):**
-  ```powershell
+- **Phục hồi `worker1` (chạy trực tiếp trên `cp`):**
+  ```bash
   az vm start -g rg-k8s -n worker1
   ```
   Sau khi cả `cp`, `worker1`, `worker2` đều về `Ready`, Kubernetes không tự kéo ngược Pod từ `worker2` về `worker1`; nếu muốn chia đều lại Pod Frontend/Backend qua 2 worker, chạy trên `cp`:

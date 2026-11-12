@@ -54,6 +54,45 @@ data:
     COMMENT ON COLUMN tasks.created_at IS 'Thoi diem tao (UTC)';
     COMMENT ON COLUMN tasks.updated_at IS 'Thoi diem cap nhat cuoi (trigger)';
 ---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-nfs-pv
+  labels:
+    app: postgres
+spec:
+  capacity:
+    storage: 5Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: manual
+  mountOptions:
+    - nfsvers=4.2
+    - hard
+    - timeo=30
+    - retrans=3
+  nfs:
+    server: 10.10.1.10
+    path: /srv/nfs/pgdata
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: cdb-kanban
+  labels:
+    app: postgres
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: manual
+  resources:
+    requests:
+      storage: 5Gi
+  volumeName: postgres-nfs-pv
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -123,7 +162,8 @@ spec:
               memory: 512Mi
       volumes:
         - name: pgdata
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: postgres-pvc
         - name: initdb
           configMap:
             name: postgres-initdb

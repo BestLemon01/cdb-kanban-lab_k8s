@@ -81,7 +81,7 @@ Sử dụng `ARG APP_VERSION` ngay trong hai `Dockerfile` để đóng gói và 
 Toàn bộ tài nguyên được khai báo dưới dạng mã trong thư mục `k8s/` và áp dụng qua `kubectl apply -f k8s/`:
 
 1. `00-namespace.yaml`: Tạo Namespace riêng `cdb-kanban`.
-2. `01-postgres.yaml`: Khai báo `Secret` `cdb-secrets`, `ConfigMap` `postgres-initdb` chứa `schema.sql`, `Deployment` `postgres` (`postgres:17-alpine`, chiến lược `Recreate`, `tolerations` 10s, `terminationGracePeriodSeconds: 5`, readiness/liveness dùng `pg_isready`) và `ClusterIP Service` `postgres-svc:5432`.
+2. `01-postgres.yaml`: Khai báo `Secret` `cdb-secrets`, `ConfigMap` `postgres-initdb` chứa `schema.sql`, `PersistentVolume` `postgres-nfs-pv` (`10.10.1.10:/srv/nfs/pgdata`) và `PersistentVolumeClaim` `postgres-pvc`, `Deployment` `postgres` (`postgres:17-alpine`, chiến lược `Recreate`, `tolerations` 10s, `terminationGracePeriodSeconds: 5`, readiness/liveness dùng `pg_isready`) và `ClusterIP Service` `postgres-svc:5432`.
 3. `02-backend.yaml`: Khai báo `ConfigMap` `backend-config`, `Deployment` `cdb-backend` (`replicas: 2`, `RollingUpdate` `maxSurge: 1, maxUnavailable: 0`, `topologySpreadConstraints` theo `kubernetes.io/hostname` kèm `matchLabelKeys: [pod-template-hash]`, `tolerations` 10s cho `not-ready`/`unreachable`, `preStop: sleep 2` cùng `terminationGracePeriodSeconds: 8`) và `ClusterIP Service` `backend-svc:8000`.
 4. `03-frontend.yaml`: Khai báo `Deployment` `cdb-frontend` (`replicas: 2`, `topologySpreadConstraints` + `RollingUpdate` + `tolerations` 10s + `preStop: sleep 2` tương tự Backend) và `NodePort Service` `frontend-svc` ánh xạ cổng `80 -> 30080`.
 
@@ -95,7 +95,7 @@ Toàn bộ tài nguyên được khai báo dưới dạng mã trong thư mục `
 | **Scale lên 4 replicas** | `kubectl scale deployment cdb-frontend -n cdb-kanban --replicas=4` | 4/4 Pod `Running`: đúng 2 Pod trên `worker1` và 2 Pod trên `worker2`; sau đó thu gọn sạch về `2`. |
 | **Rolling Update `v1 -> v2`** | `kubectl set image` lên `:v2` cho Backend và Frontend | Pod `:v2` đạt `Ready` trước khi chấm dứt Pod `:v1` (`maxUnavailable: 0`); UI & `/api/health` trả `version: "v2"`, task Kanban trong PostgreSQL được giữ nguyên. |
 | **Rollback `v2 -> v1`** | `kubectl rollout undo` cho Backend và Frontend | Lịch sử lên revision 3, `/api/health` xác nhận trả về lại `"version": "v1"` không mất dữ liệu. |
-| **Tắt 1 Worker Node (`worker1`)** | `az vm deallocate -g rg-k8s -n worker1` (trong khi `postgres` nằm trên `worker2`) | `worker1` chuyển `NotReady`; sau ~30s Pod displaced được tạo mới ngay trên `worker2` đưa `cdb-backend` & `cdb-frontend` về `2/2 Running`. Truy cập `http://20.24.211.55:30080` đăng nhập và đọc task bình thường. Bật lại `worker1` bằng `az vm start`, node quay lại `Ready`. |
+| **Tắt 1 Worker Node (`worker1` / `worker2`)** | `az vm deallocate -g rg-k8s -n worker1` | `worker1` chuyển `NotReady`; sau ~30s các Pod (kể cả `postgres`) được tạo lại sang `worker2` đưa hệ thống về chạy bình thường, dữ liệu DB trên NFS `PV/PVC` được giữ nguyên. Bật lại `worker1` bằng `az vm start`, node quay lại `Ready`. |
 
 ---
 

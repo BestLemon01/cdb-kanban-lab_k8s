@@ -106,7 +106,7 @@ ssh -i ~/.ssh/id_rsa_azure azureuser@20.24.211.55    # worker2
 
 - **Cấu hình VM:** Ubuntu 24.04.5 LTS, tối thiểu 2 vCPU / 3.8 GiB RAM mỗi node (`Standard_B2als_v2`), giao tiếp nội bộ qua subnet `10.10.1.0/24`.
 - **Tường lửa / NSG (`nsg-k8s`):** Mở inbound TCP `22` (SSH), `30000-32767` (NodePort), tùy chọn `80`/`443`; cho phép lưu lượng nội bộ trong VNet (`AllowVnetInBound` cho API server `6443/TCP`, Flannel VXLAN `8472/UDP`, `kubelet` `10250/TCP`).
-- **Công cụ trên node:** `containerd` (đã bật plugin `cri` và `SystemdCgroup = true`), `kubelet`, `kubeadm`, `kubectl` (`v1.35.10`), Docker Engine trên máy build và tài khoản Docker Hub (`bestlemon01`).
+- **Công cụ trên node:** `containerd` (đã bật plugin `cri` và `SystemdCgroup = true`), `kubelet`, `kubeadm`, `kubectl` (`v1.35.10`), `nfs-kernel-server` (trên `cp`), `nfs-common` (trên 2 worker), Docker Engine trên máy build và tài khoản Docker Hub (`bestlemon01`).
 
 ---
 
@@ -173,6 +173,19 @@ kubeadm token create --print-join-command
 kubectl get nodes -o wide
 ```
 
+Cài đặt **NFS Storage** dùng chung để lưu bền vững dữ liệu PostgreSQL (`PV/PVC` trong `k8s/01-postgres.yaml`):
+
+```bash
+# Trên cp (10.10.1.10): tạo và chia sẻ thư mục /srv/nfs/pgdata trong mạng nội bộ VNet
+sudo apt-get update && sudo apt-get install -y nfs-kernel-server
+sudo mkdir -p /srv/nfs/pgdata && sudo chmod 0777 /srv/nfs/pgdata
+echo '/srv/nfs/pgdata 10.10.1.0/24(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports
+sudo exportfs -ra && sudo systemctl enable --now nfs-kernel-server
+
+# Trên worker1 và worker2: cài NFS client để mount PersistentVolume
+sudo apt-get update && sudo apt-get install -y nfs-common
+```
+
 ### Bước 2: Build và Push Docker Image (`v1`, `v2`)
 
 Thực hiện tại thư mục gốc của repository trên node có Docker đã đăng nhập (`docker login`):
@@ -213,6 +226,7 @@ Truy cập ứng dụng trên trình duyệt tại:
 | Backend | `ConfigMap/backend-config` | `COOKIE_SECURE="false"` | Cho phép cookie phiên `cdb_session` hoạt động qua HTTP NodePort |
 | Database & App | `Secret/cdb-secrets` | `POSTGRES_*`, `DB_USER`, `DB_PASSWORD`, `APP_SECRET_KEY` | Thông tin xác thực DB và khóa ký session Flask |
 | Schema Init | `ConfigMap/postgres-initdb` | `01-schema.sql` | Tự động tạo bảng `users`, `tasks`, index và trigger lúc khởi tạo DB |
+| Database Storage | `PV postgres-nfs-pv` & `PVC postgres-pvc` | `10.10.1.10:/srv/nfs/pgdata` | Lưu trữ bền vững qua NFS, giữ nguyên dữ liệu khi Pod SQL chuyển giữa `worker1` và `worker2` |
 
 > **Lưu ý bảo mật:** Giá trị `Secret` trong `k8s/01-postgres.yaml` chỉ dùng cho môi trường lab/học tập. Khi triển khai môi trường thực tế, cần tạo Secret từ CI/CD hoặc External Secrets và bật HTTPS kèm `COOKIE_SECURE="true"`.
 
@@ -359,7 +373,7 @@ az vm deallocate -g rg-k8s -n worker1
 ```
 
 - **Quan sát trên `cp`:** sau ~`16–20s`, `worker1` chuyển `NotReady`; sau tổng ~`28–30s`, toàn bộ Pod trên `worker1` được chuyển sang `worker2`.
-- **Lưu ý dữ liệu DB (`emptyDir`):** Nếu Pod `postgres` đang nằm trên worker vừa bị tắt (ví dụ `worker1`), Kubernetes vẫn tự tạo lại Pod `postgres` mới sang `worker2` để ứng dụng tiếp tục chạy, nhưng database sẽ được khởi tạo trống lại từ `ConfigMap/postgres-initdb`. Nếu worker bị tắt không chứa `postgres`, dữ liệu DB được giữ nguyên.
+- **Dữ liệu DB bền vững (`PV`/`PVC` qua NFS):** Nhờ `01-postgres.yaml` gắn `PersistentVolumeClaim/postgres-pvc` trỏ về NFS trên `cp` (`10.10.1.10:/srv/nfs/pgdata`), kể cả khi tắt đúng worker đang chứa `postgres` (ví dụ `worker1`), Kubernetes tạo lại Pod `postgres` sang `worker2` và **toàn bộ tài khoản/task đã tạo vẫn được giữ nguyên**.
 - **Kiểm tra truy cập qua node sống (`worker2`):**
   ```bash
   curl -s http://20.24.211.55:30080/api/health
